@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -18,7 +18,7 @@ app = FastAPI()
 ADMIN_TG_ID = 810418985
 ALLOWED_CITIES = ["Москва", "Санкт-Петербург"]
 
-# IMPORTANT: new DB file name so schema is clean (old data won't be here)
+# New DB file name so schema is clean (old data won't be here)
 DB_PATH = os.getenv("DB_PATH", "app_prod.db")
 
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
@@ -51,8 +51,28 @@ def validate_dates(dates: Optional[List[str]]) -> List[str]:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
             raise ValueError("bad_date")
         out.append(d)
-    # unique + sorted
     return sorted(set(out))
+
+
+def exp_to_int(exp_str: str) -> int:
+    s = (exp_str or "").strip()
+    s = s.replace("+", "")
+    try:
+        return int(s)
+    except Exception:
+        return 0
+
+
+def rate_to_int(rate_str: Optional[str]) -> Optional[int]:
+    if rate_str is None:
+        return None
+    s = str(rate_str).strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except Exception:
+        return None
 
 
 # -------------------- DB Models --------------------
@@ -60,7 +80,7 @@ class Assistant(Base):
     __tablename__ = "assistants"
     id = Column(Integer, primary_key=True, index=True)
 
-    tg_user_id = Column(Integer, nullable=True, index=True)  # Telegram numeric ID
+    tg_user_id = Column(Integer, nullable=True, index=True)
     tg_username = Column(String(64), nullable=True, index=True)
 
     name = Column(String(120), nullable=False)
@@ -158,7 +178,7 @@ def upsert_assistant(payload: AssistantIn):
     try:
         phone = normalize_phone(payload.phone)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Неверный телефон (слишком короткий).")
+        raise HTTPException(status_code=400, detail="Неверный телефон.")
 
     try:
         city = validate_city(payload.city)
@@ -168,12 +188,11 @@ def upsert_assistant(payload: AssistantIn):
     try:
         dates = validate_dates(payload.availability_dates)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Неверная дата. Выбирайте календарём.")
+        raise HTTPException(status_code=400, detail="Неверная дата.")
 
     db = SessionLocal()
     try:
         obj = None
-        # Prefer tg_user_id for uniqueness, fallback to username
         if payload.tg_user_id:
             obj = db.query(Assistant).filter(Assistant.tg_user_id == payload.tg_user_id).first()
         if obj is None and payload.tg_username:
@@ -232,7 +251,9 @@ def get_my_assistant(
 @app.get("/api/assistants")
 def list_assistants(
     city: Optional[str] = None,
-    date: Optional[str] = None,  # YYYY-MM-DD
+    date: Optional[str] = None,      # YYYY-MM-DD
+    exp_min: Optional[int] = None,   # 0..5
+    rate_max: Optional[int] = None,  # int
 ):
     db = SessionLocal()
     try:
@@ -243,19 +264,29 @@ def list_assistants(
                 return []
             q = q.filter(Assistant.city == city)
 
-        items = [assistant_to_dict(a) for a in q.order_by(Assistant.rating.desc(), Assistant.created_at.desc()).limit(300).all()]
+        items = [assistant_to_dict(a) for a in q.order_by(Assistant.rating.desc(), Assistant.created_at.desc()).limit(500).all()]
 
+        # date filter
         if date:
             date = date.strip()
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
                 return []
-            # filter by availability_dates contains date
+            items = [a for a in items if date in (a.get("availability_dates") or [])]
+
+        # exp_min
+        if exp_min is not None:
+            items = [a for a in items if exp_to_int(a.get("exp", "0")) >= int(exp_min)]
+
+        # rate_max
+        if rate_max is not None:
+            rm = int(rate_max)
             filtered = []
             for a in items:
-                dates = a.get("availability_dates") or []
-                if date in dates:
+                r = rate_to_int(a.get("rate"))
+                # если ставка не указана — не показываем при фильтре
+                if r is not None and r <= rm:
                     filtered.append(a)
-            return filtered
+            items = filtered
 
         return items
     finally:
@@ -268,7 +299,7 @@ def upsert_employer(payload: EmployerIn):
     try:
         phone = normalize_phone(payload.phone)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Неверный телефон (слишком короткий).")
+        raise HTTPException(status_code=400, detail="Неверный телефон.")
 
     try:
         city = validate_city(payload.city)
@@ -350,7 +381,7 @@ def admin_list_assistants(tg_user_id: int = Query(...)):
     require_admin(tg_user_id)
     db = SessionLocal()
     try:
-        items = db.query(Assistant).order_by(Assistant.created_at.desc()).limit(500).all()
+        items = db.query(Assistant).order_by(Assistant.created_at.desc()).limit(800).all()
         return {"ok": True, "items": [assistant_to_dict(x) for x in items]}
     finally:
         db.close()
@@ -361,7 +392,7 @@ def admin_list_employers(tg_user_id: int = Query(...)):
     require_admin(tg_user_id)
     db = SessionLocal()
     try:
-        items = db.query(Employer).order_by(Employer.created_at.desc()).limit(500).all()
+        items = db.query(Employer).order_by(Employer.created_at.desc()).limit(800).all()
         return {"ok": True, "items": [employer_to_dict(x) for x in items]}
     finally:
         db.close()
@@ -402,7 +433,6 @@ HTML = r'''
     :root{
       --bg:#0b1220;
       --card:rgba(255,255,255,.06);
-      --card2:rgba(255,255,255,.08);
       --text:rgba(255,255,255,.92);
       --muted:rgba(255,255,255,.65);
       --line:rgba(255,255,255,.12);
@@ -427,7 +457,6 @@ HTML = r'''
     .wrap{max-width:920px;margin:0 auto}
     .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}
     .brand h1{margin:0;font-size:20px;letter-spacing:.2px}
-    .brand p{margin:4px 0 0;color:var(--muted);font-size:13px}
     .pill{
       padding:8px 10px;border:1px solid var(--line);border-radius:999px;
       font-size:12px;color:var(--muted);
@@ -486,8 +515,9 @@ HTML = r'''
       display:inline-block;padding:10px 12px;border-radius:12px;
       background:linear-gradient(135deg, var(--accent), var(--accent2));
       color:#081022;font-weight:900;text-decoration:none;
+      white-space:nowrap;
     }
-    .ghost{opacity:.85}
+    .centerChoices{display:grid;gap:10px}
   </style>
 </head>
 <body>
@@ -495,32 +525,39 @@ HTML = r'''
     <div class="top">
       <div class="brand">
         <h1>Dental Assistant Finder</h1>
-        <p id="subtitle">Заполни профиль один раз — дальше будет кабинет.</p>
       </div>
-      <div class="pill" id="tgBadge">Telegram: не подключён</div>
+      <div class="pill" id="tgBadge">Telegram</div>
     </div>
 
-    <div class="tabs">
-      <button class="tab tabActive" id="tabAssistant" onclick="setRole('assistant')">Ассистент</button>
+    <div class="tabs" id="tabs" style="display:none;">
+      <button class="tab" id="tabAssistant" onclick="setRole('assistant')">Ассистент</button>
       <button class="tab" id="tabEmployer" onclick="setRole('employer')">Работодатель</button>
       <button class="tab" id="tabAdmin" onclick="setRole('admin')" style="display:none;">Админ</button>
     </div>
 
+    <!-- ROLE CHOICE -->
+    <div class="card" id="roleChoice" style="display:none;">
+      <h2 class="sectionTitle">Выберите роль</h2>
+      <div class="centerChoices">
+        <button class="btn btnPrimary" onclick="setRole('assistant')">Я ассистент</button>
+        <button class="btn" onclick="setRole('employer')">Я работодатель</button>
+      </div>
+    </div>
+
     <!-- Assistant Dashboard -->
     <div class="card" id="assistantDash" style="display:none;">
-      <h2 class="sectionTitle">Кабинет ассистента</h2>
+      <h2 class="sectionTitle">Личный кабинет (ассистент)</h2>
       <div class="small" id="assistantSummary">Загрузка…</div>
       <div class="rowPills" id="assistantDatesPills" style="display:none;"></div>
       <div class="actions">
-        <button class="btn btnPrimary" onclick="openAssistantForm()">Редактировать анкету</button>
-        <button class="btn" onclick="setRole('employer')">Переключиться на работодателя</button>
+        <button class="btn btnPrimary" onclick="openAssistantForm()">Редактировать</button>
+        <button class="btn" onclick="goRoleChoice()">Назад</button>
       </div>
-      <div class="small">Дальше можно добавить: подтверждения, рейтинг, жалобы, фильтры по опыту/ставке.</div>
     </div>
 
     <!-- Assistant Form -->
-    <div class="card" id="assistantForm">
-      <h2 class="sectionTitle">Анкета ассистента</h2>
+    <div class="card" id="assistantForm" style="display:none;">
+      <h2 class="sectionTitle">Профиль ассистента</h2>
       <div class="grid two">
         <div>
           <label>Имя *</label>
@@ -544,7 +581,7 @@ HTML = r'''
         <div>
           <label>Опыт (лет)</label>
           <select id="a_exp">
-            <option value="0">0 (стажировка)</option>
+            <option value="0">0</option>
             <option value="1">1</option>
             <option value="2">2</option>
             <option value="3">3+</option>
@@ -559,10 +596,10 @@ HTML = r'''
           <input id="a_rate" type="number" inputmode="numeric" placeholder="Например, 500" />
         </div>
         <div>
-          <label>Даты, когда можешь выйти</label>
+          <label>Когда можете выйти</label>
           <div class="grid two">
             <div><input id="a_date" type="date" /></div>
-            <div><button class="btn" type="button" onclick="addDate()">Добавить дату</button></div>
+            <div><button class="btn" type="button" onclick="addDate()">Добавить</button></div>
           </div>
           <div class="rowPills" id="a_dates_view">Пока не выбрано</div>
         </div>
@@ -570,44 +607,63 @@ HTML = r'''
 
       <div class="grid" style="margin-top:10px;">
         <div>
-          <label>Коротко о себе / навыки</label>
-          <textarea id="a_about" placeholder="Ассистирование, стерилизация, снимки, 4 руки..."></textarea>
+          <label>О себе</label>
+          <textarea id="a_about" placeholder="Коротко: навыки, что умеете..."></textarea>
         </div>
       </div>
 
       <div class="actions">
         <button class="btn btnPrimary" onclick="saveAssistant()">Сохранить</button>
-        <button class="btn" onclick="cancelAssistant()">Отмена</button>
+        <button class="btn" onclick="cancelAssistant()">Назад</button>
       </div>
 
-      <div class="note ok" id="a_ok">✅ Сохранено!</div>
+      <div class="note ok" id="a_ok">✅ Сохранено</div>
       <div class="note err" id="a_err">❌ Ошибка</div>
-      <div class="small">После сохранения при следующем входе откроется кабинет.</div>
     </div>
 
     <!-- Employer Dashboard -->
     <div class="card" id="employerDash" style="display:none;">
-      <h2 class="sectionTitle">Кабинет работодателя</h2>
+      <h2 class="sectionTitle">Личный кабинет (работодатель)</h2>
       <div class="small" id="employerSummary">Загрузка…</div>
+
+      <h2 class="sectionTitle" style="margin-top:14px;">Поиск ассистента</h2>
+
+      <div class="grid two">
+        <div>
+          <label>Дата</label>
+          <input id="e_filter_date" type="date" />
+        </div>
+        <div>
+          <label>Опыт (от)</label>
+          <select id="e_filter_exp">
+            <option value="">Не важно</option>
+            <option value="0">0</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3+</option>
+            <option value="5">5+</option>
+          </select>
+        </div>
+      </div>
 
       <div class="grid two" style="margin-top:10px;">
         <div>
-          <label>Фильтр по дате</label>
-          <input id="e_filter_date" type="date" />
-          <div class="small ghost">Если выбрана дата — покажет только свободных в этот день.</div>
+          <label>Ставка (до, ₽/час)</label>
+          <input id="e_filter_rate" type="number" inputmode="numeric" placeholder="Например, 700" />
         </div>
         <div>
           <label>&nbsp;</label>
-          <button class="btn btnPrimary" onclick="searchAssistants()">Найти ассистента</button>
+          <button class="btn btnPrimary" onclick="searchAssistants()">Найти</button>
         </div>
       </div>
 
       <div class="actions">
         <button class="btn" onclick="openEmployerForm()">Редактировать профиль</button>
+        <button class="btn" onclick="goRoleChoice()">Назад</button>
       </div>
 
       <div id="listWrap" style="margin-top:12px; display:none;">
-        <h2 class="sectionTitle">Ассистенты</h2>
+        <h2 class="sectionTitle">Результаты</h2>
         <div class="list" id="list"></div>
       </div>
 
@@ -639,35 +695,30 @@ HTML = r'''
         </div>
         <div>
           <label>Комментарий</label>
-          <input id="e_about" placeholder="Например, ищем ассистента на завтра" />
+          <input id="e_about" placeholder="Например, ищем ассистента" />
         </div>
       </div>
 
       <div class="actions">
         <button class="btn btnPrimary" onclick="saveEmployer()">Сохранить</button>
-        <button class="btn" onclick="cancelEmployer()">Отмена</button>
+        <button class="btn" onclick="cancelEmployer()">Назад</button>
       </div>
 
-      <div class="note ok" id="e_ok">✅ Сохранено!</div>
+      <div class="note ok" id="e_ok">✅ Сохранено</div>
       <div class="note err" id="e_err2">❌ Ошибка</div>
-      <div class="small">После сохранения при следующем входе откроется кабинет.</div>
     </div>
 
     <!-- Admin Panel -->
     <div class="card" id="adminPanel" style="display:none;">
-      <h2 class="sectionTitle">Админ-панель</h2>
+      <h2 class="sectionTitle">Админ</h2>
       <div class="small" id="adminSummary">Загрузка…</div>
       <div class="actions">
         <button class="btn btnPrimary" onclick="adminLoadAssistants()">Ассистенты</button>
         <button class="btn" onclick="adminLoadEmployers()">Работодатели</button>
+        <button class="btn" onclick="goRoleChoice()">Назад</button>
       </div>
       <div class="list" id="adminList"></div>
       <div class="note err" id="adminErr">❌ Ошибка</div>
-      <div class="small ghost">MVP-админка: просмотр и удаление. Позже можно добавить блокировки, жалобы, рейтинг.</div>
-    </div>
-
-    <div class="small" style="margin-top:12px;">
-      MVP-версия. Следующее улучшение: жалобы/рейтинг, подтверждение сделки, скрытие телефона до согласия.
     </div>
   </div>
 
@@ -689,10 +740,11 @@ HTML = r'''
     if (!el) return;
     el.innerText = msg;
     el.style.display = 'block';
-    setTimeout(()=> el.style.display = 'none', 2600);
+    setTimeout(()=> el.style.display = 'none', 2200);
   }
 
   function hideAll(){
+    document.getElementById('roleChoice').style.display='none';
     document.getElementById('assistantDash').style.display='none';
     document.getElementById('assistantForm').style.display='none';
     document.getElementById('employerDash').style.display='none';
@@ -706,27 +758,32 @@ HTML = r'''
     document.getElementById('tabAdmin').classList.toggle('tabActive', role==='admin');
   }
 
+  function goRoleChoice(){
+    localStorage.removeItem('role');
+    hideAll();
+    setTabs('');
+    document.getElementById('tabs').style.display = 'none';
+    document.getElementById('roleChoice').style.display = 'block';
+    if (tg) tg.MainButton.hide();
+  }
+
   function setRole(role){
     localStorage.setItem('role', role);
+    document.getElementById('tabs').style.display = 'flex';
     setTabs(role);
     hideAll();
 
     if (role==='assistant'){
-      document.getElementById('subtitle').innerText = 'Заполни анкету один раз — дальше будет кабинет.';
-      if (tg){ tg.MainButton.setText("Сохранить анкету"); tg.MainButton.onClick(saveAssistant); tg.MainButton.show(); }
+      if (tg){ tg.MainButton.setText("Сохранить"); tg.MainButton.onClick(saveAssistant); tg.MainButton.show(); }
       loadAssistant(true);
       return;
     }
-
     if (role==='employer'){
-      document.getElementById('subtitle').innerText = 'Создай профиль один раз — дальше кабинет + поиск по дате.';
-      if (tg){ tg.MainButton.setText("Найти ассистента"); tg.MainButton.onClick(searchAssistants); tg.MainButton.show(); }
+      if (tg){ tg.MainButton.setText("Найти"); tg.MainButton.onClick(searchAssistants); tg.MainButton.show(); }
       loadEmployer(true);
       return;
     }
-
     if (role==='admin'){
-      document.getElementById('subtitle').innerText = 'Админ-панель.';
       if (tg){ tg.MainButton.hide(); }
       document.getElementById('adminPanel').style.display='block';
       adminLoadSummary();
@@ -774,8 +831,8 @@ HTML = r'''
 
     const summary = [
       `<b>${esc(a.name)}</b> • ${esc(a.city)}`,
-      `Тел: ${esc(a.phone)}`,
-      `Опыт: ${esc(a.exp)} • ₽/час: ${esc(a.rate || '—')} • Рейтинг: ${esc(String(a.rating||5))}`
+      `Телефон: ${esc(a.phone)}`,
+      `Опыт: ${esc(a.exp)} • Ставка: ${esc(a.rate || '—')} • Рейтинг: ${esc(String(a.rating||5))}`
     ].join('<br/>');
     document.getElementById('assistantSummary').innerHTML = summary;
 
@@ -840,8 +897,7 @@ HTML = r'''
     };
 
     if (!payload.name || !payload.city || !payload.phone){
-      showNote('a_err', 'Заполни обязательные поля: имя, город, телефон.');
-      if (tg) tg.HapticFeedback.notificationOccurred('error');
+      showNote('a_err', 'Заполните: имя, город, телефон.');
       return;
     }
 
@@ -853,21 +909,19 @@ HTML = r'''
       });
       const data = await r.json();
       if (!r.ok){
-        showNote('a_err', data.detail || 'Ошибка сохранения.');
-        if (tg) tg.HapticFeedback.notificationOccurred('error');
+        showNote('a_err', data.detail || 'Ошибка.');
         return;
       }
-      showNote('a_ok', '✅ Сохранено!');
-      if (tg) tg.HapticFeedback.notificationOccurred('success');
+      showNote('a_ok', '✅ Сохранено');
       showAssistantDash(data.assistant);
     }catch(e){
-      showNote('a_err', 'Сеть/сервер недоступны.');
+      showNote('a_err', 'Сервер недоступен.');
     }
   }
 
   function cancelAssistant(){
     if (assistantLoaded) showAssistantDash(assistantLoaded);
-    else openAssistantForm();
+    else goRoleChoice();
   }
 
   // -------- Employer --------
@@ -885,9 +939,9 @@ HTML = r'''
 
     const summary = [
       `<b>${esc(e.clinic)}</b> • ${esc(e.city)}`,
-      `Тел: ${esc(e.phone)}`,
-      `Комментарий: ${esc(e.about || '—')} • Рейтинг: ${esc(String(e.rating||5))}`
-    ].join('<br/>');
+      `Телефон: ${esc(e.phone)}`,
+      e.about ? `Комментарий: ${esc(e.about)}` : ''
+    ].filter(Boolean).join('<br/>');
     document.getElementById('employerSummary').innerHTML = summary;
   }
 
@@ -930,8 +984,7 @@ HTML = r'''
     };
 
     if (!payload.clinic || !payload.city || !payload.phone){
-      showNote('e_err2', 'Заполни обязательные поля: клиника/имя, город, телефон.');
-      if (tg) tg.HapticFeedback.notificationOccurred('error');
+      showNote('e_err2', 'Заполните: клиника/имя, город, телефон.');
       return;
     }
 
@@ -943,19 +996,19 @@ HTML = r'''
       });
       const data = await r.json();
       if (!r.ok){
-        showNote('e_err2', data.detail || 'Ошибка сохранения.');
+        showNote('e_err2', data.detail || 'Ошибка.');
         return;
       }
-      showNote('e_ok', '✅ Сохранено!');
+      showNote('e_ok', '✅ Сохранено');
       showEmployerDash(data.employer);
     }catch(e){
-      showNote('e_err2', 'Сеть/сервер недоступны.');
+      showNote('e_err2', 'Сервер недоступен.');
     }
   }
 
   function cancelEmployer(){
     if (employerLoaded) showEmployerDash(employerLoaded);
-    else openEmployerForm();
+    else goRoleChoice();
   }
 
   function tgLink(u){
@@ -966,16 +1019,20 @@ HTML = r'''
 
   async function searchAssistants(){
     const city = employerLoaded?.city || document.getElementById('e_city').value;
-    const date = document.getElementById('e_filter_date').value;
-
     if (!city){
-      showNote('e_err', 'Сначала выбери город в профиле работодателя.');
+      showNote('e_err', 'Сначала заполните профиль работодателя.');
       return;
     }
+
+    const date = document.getElementById('e_filter_date').value;
+    const expMin = document.getElementById('e_filter_exp').value;
+    const rateMax = document.getElementById('e_filter_rate').value;
 
     const qs = new URLSearchParams();
     qs.set('city', city);
     if (date) qs.set('date', date);
+    if (expMin) qs.set('exp_min', expMin.replace('+',''));
+    if (rateMax) qs.set('rate_max', String(rateMax));
 
     try{
       const r = await fetch('/api/assistants?' + qs.toString());
@@ -987,15 +1044,14 @@ HTML = r'''
       wrap.style.display = 'block';
 
       if (!Array.isArray(list) || list.length === 0){
-        box.innerHTML = '<div class="item">Никого не найдено по этому фильтру.</div>';
-        if (tg) tg.HapticFeedback.notificationOccurred('warning');
+        box.innerHTML = '<div class="item">Ничего не найдено.</div>';
         return;
       }
 
       for (const a of list){
         const link = tgLink(a.tg_username);
         const right = link ? `<a class="linkBtn" target="_blank" href="${link}">Написать</a>` : `<span class="pill">нет username</span>`;
-        const meta = [a.city, `опыт: ${a.exp}`, a.rate ? `₽/час: ${a.rate}` : null].filter(Boolean).join(' • ');
+        const meta = [a.city, `опыт: ${a.exp}`, a.rate ? `ставка: ${a.rate}` : null].filter(Boolean).join(' • ');
         const dates = Array.isArray(a.availability_dates) ? a.availability_dates : [];
         const datesLine = dates.length ? ('Даты: ' + dates.join(', ')) : 'Даты: —';
         const about = (a.about || '').slice(0, 160);
@@ -1011,15 +1067,12 @@ HTML = r'''
             </div>
             <div class="small">${esc(datesLine)}</div>
             <div class="small">${esc(about)}</div>
-            <div class="small">Тел: ${esc(a.phone || '')} • Рейтинг: ${esc(String(a.rating||5))}</div>
+            <div class="small">Рейтинг: ${esc(String(a.rating||5))}</div>
           </div>
         `;
       }
-
-      if (tg) tg.HapticFeedback.notificationOccurred('success');
     }catch(e){
-      showNote('e_err', 'Не удалось загрузить список.');
-      if (tg) tg.HapticFeedback.notificationOccurred('error');
+      showNote('e_err', 'Ошибка загрузки.');
     }
   }
 
@@ -1029,13 +1082,13 @@ HTML = r'''
       const r = await fetch('/api/admin/summary?tg_user_id=' + encodeURIComponent(String(tgUserId||0)));
       const data = await r.json();
       if (!r.ok){
-        document.getElementById('adminSummary').innerText = 'Нет доступа.';
+        document.getElementById('adminSummary').innerText = 'Нет доступа';
         return;
       }
       document.getElementById('adminSummary').innerHTML =
         `Ассистенты: <b>${esc(String(data.assistants))}</b><br/>Работодатели: <b>${esc(String(data.employers))}</b>`;
     }catch(e){
-      showNote('adminErr', 'Ошибка админки.');
+      showNote('adminErr', 'Ошибка');
     }
   }
 
@@ -1045,7 +1098,7 @@ HTML = r'''
       const data = await r.json();
       if (!r.ok){ showNote('adminErr', data.detail || 'Нет доступа'); return; }
       renderAdminList('assistant', data.items || []);
-    }catch(e){ showNote('adminErr', 'Ошибка загрузки'); }
+    }catch(e){ showNote('adminErr', 'Ошибка'); }
   }
 
   async function adminLoadEmployers(){
@@ -1054,7 +1107,7 @@ HTML = r'''
       const data = await r.json();
       if (!r.ok){ showNote('adminErr', data.detail || 'Нет доступа'); return; }
       renderAdminList('employer', data.items || []);
-    }catch(e){ showNote('adminErr', 'Ошибка загрузки'); }
+    }catch(e){ showNote('adminErr', 'Ошибка'); }
   }
 
   function renderAdminList(kind, items){
@@ -1068,9 +1121,8 @@ HTML = r'''
       const title = kind === 'assistant'
         ? `${esc(x.name)} • ${esc(x.city)}`
         : `${esc(x.clinic)} • ${esc(x.city)}`;
-      const sub = kind === 'assistant'
-        ? `Тел: ${esc(x.phone)} • tg: ${esc(x.tg_username||'—')} • id: ${esc(String(x.id))}`
-        : `Тел: ${esc(x.phone)} • tg: ${esc(x.tg_username||'—')} • id: ${esc(String(x.id))}`;
+
+      const sub = `Тел: ${esc(x.phone)} • tg: ${esc(x.tg_username||'—')} • id: ${esc(String(x.id))}`;
 
       box.innerHTML += `
         <div class="item">
@@ -1078,7 +1130,7 @@ HTML = r'''
             <div>
               <div class="itemName">${title}</div>
               <div class="itemMeta">${sub}</div>
-              <div class="small">Создано: ${esc(String(x.created_at||''))}</div>
+              <div class="small">${esc(String(x.created_at||''))}</div>
             </div>
             <div>
               <a class="linkBtn" href="#" onclick="adminDelete('${kind}', ${x.id}); return false;">Удалить</a>
@@ -1090,7 +1142,7 @@ HTML = r'''
   }
 
   async function adminDelete(kind, id){
-    if (!confirm('Точно удалить?')) return;
+    if (!confirm('Удалить?')) return;
     try{
       const qs = new URLSearchParams();
       qs.set('kind', kind);
@@ -1099,9 +1151,10 @@ HTML = r'''
       const r = await fetch('/api/admin/delete?' + qs.toString(), {method:'POST'});
       const data = await r.json();
       if (!r.ok){ showNote('adminErr', data.detail || 'Ошибка'); return; }
-      // refresh
       if (kind==='assistant') adminLoadAssistants(); else adminLoadEmployers();
-    }catch(e){ showNote('adminErr', 'Ошибка'); }
+    }catch(e){
+      showNote('adminErr', 'Ошибка');
+    }
   }
 
   // -------- Init --------
@@ -1112,24 +1165,22 @@ HTML = r'''
       tgUserId = u?.id || null;
       username = u?.username ? ('@' + u.username) : null;
 
-      document.getElementById('tgBadge').innerText = tgUserId
-        ? ('Telegram: ' + (username || 'без username'))
-        : 'Telegram: без данных';
+      document.getElementById('tgBadge').innerText =
+        username ? ('@' + username.replace('@','')) : 'без username';
 
-      // show admin tab only for your ID
       if (tgUserId === 810418985){
         document.getElementById('tabAdmin').style.display = 'inline-block';
       }
-
-      // Nice: show main button always
-      tg.MainButton.show();
     } else {
-      document.getElementById('tgBadge').innerText = 'Открыто не из Telegram';
-      // Hide admin tab if outside tg
+      document.getElementById('tgBadge').innerText = 'не Telegram';
       document.getElementById('tabAdmin').style.display = 'none';
     }
 
-    const role = localStorage.getItem('role') || 'assistant';
+    const role = localStorage.getItem('role');
+    if (!role){
+      goRoleChoice();
+      return;
+    }
     setRole(role);
   })();
 </script>
