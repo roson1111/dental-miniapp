@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
@@ -14,18 +14,21 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 app = FastAPI()
 
-# -------------------- DB (SQLite) --------------------
-# New DB file name to avoid schema mismatch with older versions.
-DB_PATH = os.getenv("DB_PATH", "app_v3.db")
+# -------------------- Config --------------------
+ADMIN_TG_ID = 810418985
+ALLOWED_CITIES = ["Москва", "Санкт-Петербург"]
+
+# IMPORTANT: new DB file name so schema is clean (old data won't be here)
+DB_PATH = os.getenv("DB_PATH", "app_prod.db")
+
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-ALLOWED_CITIES = ["Москва", "Санкт-Петербург"]
 
-
+# -------------------- Helpers --------------------
 def normalize_phone(phone: str) -> str:
-    p = phone.strip()
+    p = (phone or "").strip()
     p = re.sub(r"[^\d+]", "", p)
     digits = re.sub(r"\D", "", p)
     if len(digits) < 10:
@@ -40,9 +43,24 @@ def validate_city(city: str) -> str:
     return c
 
 
+def validate_dates(dates: Optional[List[str]]) -> List[str]:
+    dates = dates or []
+    out = []
+    for d in dates:
+        d = (d or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            raise ValueError("bad_date")
+        out.append(d)
+    # unique + sorted
+    return sorted(set(out))
+
+
+# -------------------- DB Models --------------------
 class Assistant(Base):
     __tablename__ = "assistants"
     id = Column(Integer, primary_key=True, index=True)
+
+    tg_user_id = Column(Integer, nullable=True, index=True)  # Telegram numeric ID
     tg_username = Column(String(64), nullable=True, index=True)
 
     name = Column(String(120), nullable=False)
@@ -53,7 +71,7 @@ class Assistant(Base):
     rate = Column(String(20), nullable=True)
     about = Column(Text, nullable=True)
 
-    availability_dates = Column(Text, nullable=True)  # JSON string list
+    availability_dates = Column(Text, nullable=True)  # JSON array of dates
 
     rating = Column(Integer, nullable=False, default=5)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -62,6 +80,8 @@ class Assistant(Base):
 class Employer(Base):
     __tablename__ = "employers"
     id = Column(Integer, primary_key=True, index=True)
+
+    tg_user_id = Column(Integer, nullable=True, index=True)
     tg_username = Column(String(64), nullable=True, index=True)
 
     clinic = Column(String(160), nullable=False)
@@ -76,31 +96,10 @@ class Employer(Base):
 Base.metadata.create_all(bind=engine)
 
 
-# -------------------- Schemas --------------------
-class AssistantIn(BaseModel):
-    tg_username: Optional[str] = None
-    name: str = Field(min_length=2, max_length=120)
-    city: str = Field(min_length=2, max_length=120)
-    phone: str = Field(min_length=8, max_length=40)
-
-    exp: str = "0"
-    rate: Optional[str] = None
-    about: Optional[str] = None
-
-    availability_dates: Optional[List[str]] = None
-
-
-class EmployerIn(BaseModel):
-    tg_username: Optional[str] = None
-    clinic: str = Field(min_length=2, max_length=160)
-    city: str = Field(min_length=2, max_length=120)
-    phone: str = Field(min_length=8, max_length=40)
-    about: Optional[str] = None
-
-
 def assistant_to_dict(a: Assistant) -> Dict[str, Any]:
     return {
         "id": a.id,
+        "tg_user_id": a.tg_user_id,
         "tg_username": a.tg_username,
         "name": a.name,
         "city": a.city,
@@ -110,22 +109,50 @@ def assistant_to_dict(a: Assistant) -> Dict[str, Any]:
         "about": a.about,
         "availability_dates": json.loads(a.availability_dates or "[]"),
         "rating": a.rating,
+        "created_at": a.created_at.isoformat(),
     }
 
 
 def employer_to_dict(e: Employer) -> Dict[str, Any]:
     return {
         "id": e.id,
+        "tg_user_id": e.tg_user_id,
         "tg_username": e.tg_username,
         "clinic": e.clinic,
         "city": e.city,
         "phone": e.phone,
         "about": e.about,
         "rating": e.rating,
+        "created_at": e.created_at.isoformat(),
     }
 
 
-# -------------------- API --------------------
+# -------------------- Schemas --------------------
+class AssistantIn(BaseModel):
+    tg_user_id: Optional[int] = None
+    tg_username: Optional[str] = None
+
+    name: str = Field(min_length=2, max_length=120)
+    city: str = Field(min_length=2, max_length=120)
+    phone: str = Field(min_length=8, max_length=40)
+
+    exp: str = "0"
+    rate: Optional[str] = None
+    about: Optional[str] = None
+    availability_dates: Optional[List[str]] = None
+
+
+class EmployerIn(BaseModel):
+    tg_user_id: Optional[int] = None
+    tg_username: Optional[str] = None
+
+    clinic: str = Field(min_length=2, max_length=160)
+    city: str = Field(min_length=2, max_length=120)
+    phone: str = Field(min_length=8, max_length=40)
+    about: Optional[str] = None
+
+
+# -------------------- API: Assistants --------------------
 @app.post("/api/assistant")
 def upsert_assistant(payload: AssistantIn):
     try:
@@ -138,20 +165,23 @@ def upsert_assistant(payload: AssistantIn):
     except ValueError:
         raise HTTPException(status_code=400, detail="Выберите город: Москва или Санкт-Петербург.")
 
-    dates = payload.availability_dates or []
-    # small validation for YYYY-MM-DD strings
-    for d in dates:
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", (d or "").strip()):
-            raise HTTPException(status_code=400, detail="Неверный формат даты. Используйте календарь.")
+    try:
+        dates = validate_dates(payload.availability_dates)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Неверная дата. Выбирайте календарём.")
 
     db = SessionLocal()
     try:
         obj = None
-        if payload.tg_username:
+        # Prefer tg_user_id for uniqueness, fallback to username
+        if payload.tg_user_id:
+            obj = db.query(Assistant).filter(Assistant.tg_user_id == payload.tg_user_id).first()
+        if obj is None and payload.tg_username:
             obj = db.query(Assistant).filter(Assistant.tg_username == payload.tg_username).first()
 
         if obj is None:
             obj = Assistant(
+                tg_user_id=payload.tg_user_id,
                 tg_username=payload.tg_username,
                 name=payload.name.strip(),
                 city=city,
@@ -159,39 +189,80 @@ def upsert_assistant(payload: AssistantIn):
                 exp=str(payload.exp).strip(),
                 rate=(payload.rate or "").strip() or None,
                 about=(payload.about or "").strip() or None,
-                availability_dates=json.dumps(sorted(set(dates)), ensure_ascii=False),
+                availability_dates=json.dumps(dates, ensure_ascii=False),
             )
             db.add(obj)
             db.commit()
             db.refresh(obj)
         else:
+            obj.tg_user_id = payload.tg_user_id or obj.tg_user_id
+            obj.tg_username = payload.tg_username or obj.tg_username
             obj.name = payload.name.strip()
             obj.city = city
             obj.phone = phone
             obj.exp = str(payload.exp).strip()
             obj.rate = (payload.rate or "").strip() or None
             obj.about = (payload.about or "").strip() or None
-            obj.availability_dates = json.dumps(sorted(set(dates)), ensure_ascii=False)
+            obj.availability_dates = json.dumps(dates, ensure_ascii=False)
             db.commit()
             db.refresh(obj)
 
-        return {"ok": True, "id": obj.id}
-    finally:
-        db.close()
-
-
-@app.get("/api/assistant")
-def get_my_assistant(tg_username: str):
-    db = SessionLocal()
-    try:
-        obj = db.query(Assistant).filter(Assistant.tg_username == tg_username).first()
-        if not obj:
-            return JSONResponse({"ok": True, "assistant": None})
         return {"ok": True, "assistant": assistant_to_dict(obj)}
     finally:
         db.close()
 
 
+@app.get("/api/assistant")
+def get_my_assistant(
+    tg_user_id: Optional[int] = None,
+    tg_username: Optional[str] = None,
+):
+    db = SessionLocal()
+    try:
+        obj = None
+        if tg_user_id:
+            obj = db.query(Assistant).filter(Assistant.tg_user_id == tg_user_id).first()
+        if obj is None and tg_username:
+            obj = db.query(Assistant).filter(Assistant.tg_username == tg_username).first()
+        return {"ok": True, "assistant": assistant_to_dict(obj) if obj else None}
+    finally:
+        db.close()
+
+
+@app.get("/api/assistants")
+def list_assistants(
+    city: Optional[str] = None,
+    date: Optional[str] = None,  # YYYY-MM-DD
+):
+    db = SessionLocal()
+    try:
+        q = db.query(Assistant)
+        if city:
+            city = city.strip()
+            if city not in ALLOWED_CITIES:
+                return []
+            q = q.filter(Assistant.city == city)
+
+        items = [assistant_to_dict(a) for a in q.order_by(Assistant.rating.desc(), Assistant.created_at.desc()).limit(300).all()]
+
+        if date:
+            date = date.strip()
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                return []
+            # filter by availability_dates contains date
+            filtered = []
+            for a in items:
+                dates = a.get("availability_dates") or []
+                if date in dates:
+                    filtered.append(a)
+            return filtered
+
+        return items
+    finally:
+        db.close()
+
+
+# -------------------- API: Employers --------------------
 @app.post("/api/employer")
 def upsert_employer(payload: EmployerIn):
     try:
@@ -207,11 +278,14 @@ def upsert_employer(payload: EmployerIn):
     db = SessionLocal()
     try:
         obj = None
-        if payload.tg_username:
+        if payload.tg_user_id:
+            obj = db.query(Employer).filter(Employer.tg_user_id == payload.tg_user_id).first()
+        if obj is None and payload.tg_username:
             obj = db.query(Employer).filter(Employer.tg_username == payload.tg_username).first()
 
         if obj is None:
             obj = Employer(
+                tg_user_id=payload.tg_user_id,
                 tg_username=payload.tg_username,
                 clinic=payload.clinic.strip(),
                 city=city,
@@ -222,6 +296,8 @@ def upsert_employer(payload: EmployerIn):
             db.commit()
             db.refresh(obj)
         else:
+            obj.tg_user_id = payload.tg_user_id or obj.tg_user_id
+            obj.tg_username = payload.tg_username or obj.tg_username
             obj.clinic = payload.clinic.strip()
             obj.city = city
             obj.phone = phone
@@ -229,42 +305,92 @@ def upsert_employer(payload: EmployerIn):
             db.commit()
             db.refresh(obj)
 
-        return {"ok": True, "id": obj.id}
-    finally:
-        db.close()
-
-
-@app.get("/api/employer")
-def get_my_employer(tg_username: str):
-    db = SessionLocal()
-    try:
-        obj = db.query(Employer).filter(Employer.tg_username == tg_username).first()
-        if not obj:
-            return JSONResponse({"ok": True, "employer": None})
         return {"ok": True, "employer": employer_to_dict(obj)}
     finally:
         db.close()
 
 
-@app.get("/api/assistants")
-def list_assistants(city: Optional[str] = None) -> List[dict]:
+@app.get("/api/employer")
+def get_my_employer(
+    tg_user_id: Optional[int] = None,
+    tg_username: Optional[str] = None,
+):
     db = SessionLocal()
     try:
-        q = db.query(Assistant)
-        if city:
-            # strict to our allowed cities
-            city = city.strip()
-            if city not in ALLOWED_CITIES:
-                return []
-            q = q.filter(Assistant.city == city)
-        q = q.order_by(Assistant.rating.desc(), Assistant.created_at.desc()).limit(200)
-        return [assistant_to_dict(a) for a in q.all()]
+        obj = None
+        if tg_user_id:
+            obj = db.query(Employer).filter(Employer.tg_user_id == tg_user_id).first()
+        if obj is None and tg_username:
+            obj = db.query(Employer).filter(Employer.tg_username == tg_username).first()
+        return {"ok": True, "employer": employer_to_dict(obj) if obj else None}
+    finally:
+        db.close()
+
+
+# -------------------- Admin API (MVP) --------------------
+def require_admin(tg_user_id: Optional[int]):
+    if tg_user_id != ADMIN_TG_ID:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+
+@app.get("/api/admin/summary")
+def admin_summary(tg_user_id: int = Query(...)):
+    require_admin(tg_user_id)
+    db = SessionLocal()
+    try:
+        a_count = db.query(Assistant).count()
+        e_count = db.query(Employer).count()
+        return {"ok": True, "assistants": a_count, "employers": e_count}
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/assistants")
+def admin_list_assistants(tg_user_id: int = Query(...)):
+    require_admin(tg_user_id)
+    db = SessionLocal()
+    try:
+        items = db.query(Assistant).order_by(Assistant.created_at.desc()).limit(500).all()
+        return {"ok": True, "items": [assistant_to_dict(x) for x in items]}
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/employers")
+def admin_list_employers(tg_user_id: int = Query(...)):
+    require_admin(tg_user_id)
+    db = SessionLocal()
+    try:
+        items = db.query(Employer).order_by(Employer.created_at.desc()).limit(500).all()
+        return {"ok": True, "items": [employer_to_dict(x) for x in items]}
+    finally:
+        db.close()
+
+
+@app.post("/api/admin/delete")
+def admin_delete(kind: str, item_id: int, tg_user_id: int):
+    require_admin(tg_user_id)
+    db = SessionLocal()
+    try:
+        if kind == "assistant":
+            obj = db.query(Assistant).filter(Assistant.id == item_id).first()
+        elif kind == "employer":
+            obj = db.query(Employer).filter(Employer.id == item_id).first()
+        else:
+            raise HTTPException(status_code=400, detail="bad kind")
+
+        if not obj:
+            raise HTTPException(status_code=404, detail="not found")
+
+        db.delete(obj)
+        db.commit()
+        return {"ok": True}
     finally:
         db.close()
 
 
 # -------------------- UI --------------------
-HTML = f"""
+HTML = r'''
 <!doctype html>
 <html>
 <head>
@@ -273,124 +399,103 @@ HTML = f"""
   <title>Dental Assistant Finder</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
-    :root{{
-      --bg: #0b1220;
-      --card: rgba(255,255,255,.06);
-      --text: rgba(255,255,255,.92);
-      --muted: rgba(255,255,255,.65);
-      --line: rgba(255,255,255,.12);
-      --accent: #6aa9ff;
-      --accent2: #7c5cff;
-      --good: rgba(60,255,180,.10);
-      --goodLine: rgba(60,255,180,.25);
-      --bad: rgba(255,80,120,.10);
-      --badLine: rgba(255,80,120,.25);
-    }}
-    *{{box-sizing:border-box}}
-    body{{
+    :root{
+      --bg:#0b1220;
+      --card:rgba(255,255,255,.06);
+      --card2:rgba(255,255,255,.08);
+      --text:rgba(255,255,255,.92);
+      --muted:rgba(255,255,255,.65);
+      --line:rgba(255,255,255,.12);
+      --accent:#6aa9ff;
+      --accent2:#7c5cff;
+      --good:rgba(60,255,180,.10);
+      --goodLine:rgba(60,255,180,.25);
+      --bad:rgba(255,80,120,.10);
+      --badLine:rgba(255,80,120,.25);
+    }
+    *{box-sizing:border-box}
+    body{
       margin:0;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
       background:
         radial-gradient(1200px 700px at 10% -10%, rgba(124,92,255,.35), transparent 60%),
         radial-gradient(900px 500px at 110% 10%, rgba(106,169,255,.28), transparent 55%),
         var(--bg);
-      color: var(--text);
-      padding: 18px 16px 24px;
-    }}
-    .wrap{{max-width: 860px; margin: 0 auto;}}
-    .top{{display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom: 14px;}}
-    .brand{{display:flex; flex-direction:column; gap:4px;}}
-    .brand h1{{margin:0; font-size:20px; letter-spacing:.2px;}}
-    .brand p{{margin:0; font-size:13px; color: var(--muted);}}
-    .pill{{
-      padding:8px 10px;
-      background: linear-gradient(135deg, rgba(106,169,255,.25), rgba(124,92,255,.22));
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      font-size: 12px;
-      color: var(--muted);
-      white-space: nowrap;
-    }}
-    .tabs{{display:flex; gap:10px; margin-bottom: 12px; flex-wrap:wrap;}}
-    .tab{{
-      padding:10px 12px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,.06);
-      color: var(--text);
-      cursor:pointer;
-      font-weight:800;
-      font-size: 13px;
-    }}
-    .tabActive{{background: linear-gradient(135deg, rgba(106,169,255,.25), rgba(124,92,255,.22));}}
-    .card{{
-      background: linear-gradient(180deg, var(--card), rgba(255,255,255,.04));
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 14px;
-      box-shadow: 0 10px 30px rgba(0,0,0,.25);
-      margin-bottom: 12px;
-    }}
-    .sectionTitle{{font-size: 14px; margin: 0 0 10px; color: rgba(255,255,255,.86); letter-spacing:.2px;}}
-    .grid{{display:grid; grid-template-columns: 1fr; gap: 10px;}}
-    @media (min-width: 620px){{ .grid.two{{grid-template-columns: 1fr 1fr;}} }}
-    label{{display:block; font-size: 12px; color: var(--muted); margin: 0 0 6px;}}
-    input, select, textarea{{
-      width:100%;
-      padding: 12px 12px;
-      border-radius: 12px;
-      border: 1px solid var(--line);
-      background: rgba(0,0,0,.18);
-      color: var(--text);
-      outline: none;
-    }}
-    textarea{{min-height: 92px; resize: vertical;}}
-    input::placeholder, textarea::placeholder{{color: rgba(255,255,255,.38);}}
-    .actions{{display:flex; gap:10px; flex-wrap: wrap; margin-top: 12px;}}
-    .btn{{
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,.06);
-      color: var(--text);
-      padding: 12px 14px;
-      border-radius: 14px;
-      cursor:pointer;
-      font-weight: 800;
-      font-size: 14px;
-      flex: 1 1 170px;
-      text-align:center;
-    }}
-    .btnPrimary{{
-      border: none;
-      background: linear-gradient(135deg, var(--accent), var(--accent2));
-      color: #081022;
-    }}
-    .btn:active{{transform: translateY(1px);}}
-    .note{{
-      display:none;
-      margin-top: 10px;
-      padding: 10px 12px;
-      border-radius: 12px;
-      font-size: 13px;
-    }}
-    .ok{{border: 1px solid var(--goodLine); background: var(--good); color: rgba(220,255,245,.95);}}
-    .err{{border: 1px solid var(--badLine); background: var(--bad); color: rgba(255,210,225,.95);}}
-    .small{{font-size:12px; color: var(--muted); margin-top: 6px; line-height:1.4;}}
-    .list{{display:grid; gap:10px; margin-top: 10px;}}
-    .item{{border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: rgba(0,0,0,.15);}}
-    .itemTop{{display:flex; justify-content:space-between; gap:10px; align-items:flex-start;}}
-    .itemName{{font-weight:900;}}
-    .itemMeta{{color: var(--muted); font-size: 12px; margin-top: 3px;}}
-    .rowPills{{margin-top:8px; display:flex; flex-wrap:wrap; gap:6px;}}
-    .miniPill{{border:1px solid var(--line); border-radius:999px; padding:6px 10px; font-size:12px; color: var(--muted); background: rgba(255,255,255,.04);}}
-    a.link{{color: rgba(255,255,255,.9);}}
+      color:var(--text);
+      padding:18px 16px 28px;
+    }
+    .wrap{max-width:920px;margin:0 auto}
+    .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}
+    .brand h1{margin:0;font-size:20px;letter-spacing:.2px}
+    .brand p{margin:4px 0 0;color:var(--muted);font-size:13px}
+    .pill{
+      padding:8px 10px;border:1px solid var(--line);border-radius:999px;
+      font-size:12px;color:var(--muted);
+      background:linear-gradient(135deg, rgba(106,169,255,.25), rgba(124,92,255,.22));
+      white-space:nowrap;
+    }
+    .tabs{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}
+    .tab{
+      padding:10px 12px;border-radius:999px;border:1px solid var(--line);
+      background:rgba(255,255,255,.06);color:var(--text);
+      font-weight:800;font-size:13px;cursor:pointer;
+    }
+    .tabActive{background:linear-gradient(135deg, rgba(106,169,255,.25), rgba(124,92,255,.22))}
+    .card{
+      background:linear-gradient(180deg, var(--card), rgba(255,255,255,.04));
+      border:1px solid var(--line);border-radius:16px;padding:14px;
+      box-shadow:0 10px 30px rgba(0,0,0,.25);
+      margin-bottom:12px;
+    }
+    .sectionTitle{margin:0 0 10px;font-size:14px;color:rgba(255,255,255,.86);letter-spacing:.2px}
+    .grid{display:grid;grid-template-columns:1fr;gap:10px}
+    @media (min-width:640px){.grid.two{grid-template-columns:1fr 1fr}}
+    label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
+    input,select,textarea{
+      width:100%;padding:12px;border-radius:12px;border:1px solid var(--line);
+      background:rgba(0,0,0,.18);color:var(--text);outline:none;
+    }
+    textarea{min-height:92px;resize:vertical}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    .btn{
+      border:1px solid var(--line);background:rgba(255,255,255,.06);
+      color:var(--text);padding:12px 14px;border-radius:14px;cursor:pointer;
+      font-weight:800;font-size:14px;flex:1 1 170px;text-align:center;
+    }
+    .btnPrimary{
+      border:none;background:linear-gradient(135deg, var(--accent), var(--accent2));
+      color:#081022;
+    }
+    .btn:active{transform:translateY(1px)}
+    .note{display:none;margin-top:10px;padding:10px 12px;border-radius:12px;font-size:13px}
+    .ok{border:1px solid var(--goodLine);background:var(--good)}
+    .err{border:1px solid var(--badLine);background:var(--bad)}
+    .small{font-size:12px;color:var(--muted);line-height:1.4;margin-top:8px}
+    .rowPills{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+    .miniPill{
+      border:1px solid var(--line);background:rgba(255,255,255,.04);
+      border-radius:999px;padding:6px 10px;font-size:12px;color:var(--muted);
+    }
+    .miniPill a{color:rgba(255,255,255,.88);text-decoration:none;margin-left:8px}
+    .list{display:grid;gap:10px;margin-top:10px}
+    .item{border:1px solid var(--line);border-radius:14px;padding:12px;background:rgba(0,0,0,.15)}
+    .itemTop{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+    .itemName{font-weight:900}
+    .itemMeta{color:var(--muted);font-size:12px;margin-top:3px}
+    .linkBtn{
+      display:inline-block;padding:10px 12px;border-radius:12px;
+      background:linear-gradient(135deg, var(--accent), var(--accent2));
+      color:#081022;font-weight:900;text-decoration:none;
+    }
+    .ghost{opacity:.85}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="top">
       <div class="brand">
-        <h1 id="title">Dental Assistant Finder</h1>
-        <p id="subtitle">Выбери роль и заполни профиль один раз.</p>
+        <h1>Dental Assistant Finder</h1>
+        <p id="subtitle">Заполни профиль один раз — дальше будет кабинет.</p>
       </div>
       <div class="pill" id="tgBadge">Telegram: не подключён</div>
     </div>
@@ -398,24 +503,24 @@ HTML = f"""
     <div class="tabs">
       <button class="tab tabActive" id="tabAssistant" onclick="setRole('assistant')">Ассистент</button>
       <button class="tab" id="tabEmployer" onclick="setRole('employer')">Работодатель</button>
+      <button class="tab" id="tabAdmin" onclick="setRole('admin')" style="display:none;">Админ</button>
     </div>
 
-    <!-- Assistant: dashboard -->
+    <!-- Assistant Dashboard -->
     <div class="card" id="assistantDash" style="display:none;">
       <h2 class="sectionTitle">Кабинет ассистента</h2>
       <div class="small" id="assistantSummary">Загрузка…</div>
       <div class="rowPills" id="assistantDatesPills" style="display:none;"></div>
       <div class="actions">
         <button class="btn btnPrimary" onclick="openAssistantForm()">Редактировать анкету</button>
-        <button class="btn" onclick="setRole('employer')">Я работодатель</button>
+        <button class="btn" onclick="setRole('employer')">Переключиться на работодателя</button>
       </div>
-      <div class="small">Дальше добавим: «Найти подработку», рейтинг и жалобы.</div>
+      <div class="small">Дальше можно добавить: подтверждения, рейтинг, жалобы, фильтры по опыту/ставке.</div>
     </div>
 
-    <!-- Assistant: form -->
+    <!-- Assistant Form -->
     <div class="card" id="assistantForm">
       <h2 class="sectionTitle">Анкета ассистента</h2>
-
       <div class="grid two">
         <div>
           <label>Имя *</label>
@@ -456,14 +561,10 @@ HTML = f"""
         <div>
           <label>Даты, когда можешь выйти</label>
           <div class="grid two">
-            <div>
-              <input id="a_date" type="date" />
-            </div>
-            <div>
-              <button class="btn" type="button" onclick="addDate()">Добавить дату</button>
-            </div>
+            <div><input id="a_date" type="date" /></div>
+            <div><button class="btn" type="button" onclick="addDate()">Добавить дату</button></div>
           </div>
-          <div class="rowPills" id="a_dates_view" style="margin-top:8px;">Пока не выбрано</div>
+          <div class="rowPills" id="a_dates_view">Пока не выбрано</div>
         </div>
       </div>
 
@@ -481,27 +582,41 @@ HTML = f"""
 
       <div class="note ok" id="a_ok">✅ Сохранено!</div>
       <div class="note err" id="a_err">❌ Ошибка</div>
-      <div class="small">Заполняешь 1 раз — при следующем входе будет кабинет.</div>
+      <div class="small">После сохранения при следующем входе откроется кабинет.</div>
     </div>
 
-    <!-- Employer: dashboard -->
+    <!-- Employer Dashboard -->
     <div class="card" id="employerDash" style="display:none;">
       <h2 class="sectionTitle">Кабинет работодателя</h2>
       <div class="small" id="employerSummary">Загрузка…</div>
+
+      <div class="grid two" style="margin-top:10px;">
+        <div>
+          <label>Фильтр по дате</label>
+          <input id="e_filter_date" type="date" />
+          <div class="small ghost">Если выбрана дата — покажет только свободных в этот день.</div>
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button class="btn btnPrimary" onclick="searchAssistants()">Найти ассистента</button>
+        </div>
+      </div>
+
       <div class="actions">
-        <button class="btn btnPrimary" onclick="searchAssistants()">Найти ассистента</button>
         <button class="btn" onclick="openEmployerForm()">Редактировать профиль</button>
       </div>
+
       <div id="listWrap" style="margin-top:12px; display:none;">
         <h2 class="sectionTitle">Ассистенты</h2>
         <div class="list" id="list"></div>
       </div>
+
+      <div class="note err" id="e_err">❌ Ошибка</div>
     </div>
 
-    <!-- Employer: form -->
+    <!-- Employer Form -->
     <div class="card" id="employerForm" style="display:none;">
       <h2 class="sectionTitle">Профиль работодателя</h2>
-
       <div class="grid two">
         <div>
           <label>Клиника / имя *</label>
@@ -534,79 +649,92 @@ HTML = f"""
       </div>
 
       <div class="note ok" id="e_ok">✅ Сохранено!</div>
-      <div class="note err" id="e_err">❌ Ошибка</div>
-      <div class="small">Заполняешь 1 раз — при следующем входе будет кабинет.</div>
+      <div class="note err" id="e_err2">❌ Ошибка</div>
+      <div class="small">После сохранения при следующем входе откроется кабинет.</div>
+    </div>
+
+    <!-- Admin Panel -->
+    <div class="card" id="adminPanel" style="display:none;">
+      <h2 class="sectionTitle">Админ-панель</h2>
+      <div class="small" id="adminSummary">Загрузка…</div>
+      <div class="actions">
+        <button class="btn btnPrimary" onclick="adminLoadAssistants()">Ассистенты</button>
+        <button class="btn" onclick="adminLoadEmployers()">Работодатели</button>
+      </div>
+      <div class="list" id="adminList"></div>
+      <div class="note err" id="adminErr">❌ Ошибка</div>
+      <div class="small ghost">MVP-админка: просмотр и удаление. Позже можно добавить блокировки, жалобы, рейтинг.</div>
     </div>
 
     <div class="small" style="margin-top:12px;">
-      MVP. Следующие шаги: отзывы/жалобы, рейтинг, верификация, фильтры по датам.
+      MVP-версия. Следующее улучшение: жалобы/рейтинг, подтверждение сделки, скрытие телефона до согласия.
     </div>
   </div>
 
 <script>
   const tg = window.Telegram?.WebApp;
+  let tgUserId = null;
   let username = null;
 
-  // Assistant state
   let selectedDates = [];
   let assistantLoaded = null;
   let employerLoaded = null;
 
+  function esc(s){
+    return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
   function showNote(id, msg){
     const el = document.getElementById(id);
+    if (!el) return;
     el.innerText = msg;
     el.style.display = 'block';
     setTimeout(()=> el.style.display = 'none', 2600);
   }
 
-  function escapeHtml(s){
-    return (s || '').replace(/[&<>"']/g, (c)=>({
-      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-    }[c]));
+  function hideAll(){
+    document.getElementById('assistantDash').style.display='none';
+    document.getElementById('assistantForm').style.display='none';
+    document.getElementById('employerDash').style.display='none';
+    document.getElementById('employerForm').style.display='none';
+    document.getElementById('adminPanel').style.display='none';
+  }
+
+  function setTabs(role){
+    document.getElementById('tabAssistant').classList.toggle('tabActive', role==='assistant');
+    document.getElementById('tabEmployer').classList.toggle('tabActive', role==='employer');
+    document.getElementById('tabAdmin').classList.toggle('tabActive', role==='admin');
   }
 
   function setRole(role){
     localStorage.setItem('role', role);
+    setTabs(role);
+    hideAll();
 
-    document.getElementById('tabAssistant').classList.toggle('tabActive', role==='assistant');
-    document.getElementById('tabEmployer').classList.toggle('tabActive', role==='employer');
-
-    // hide all cards; decide after load
-    hideAssistantAll();
-    hideEmployerAll();
-
-    if (tg){
-      tg.MainButton.hide();
-      if (role==='assistant'){
-        tg.MainButton.setText("Сохранить анкету");
-        tg.MainButton.onClick(saveAssistant);
-      } else {
-        tg.MainButton.setText("Найти ассистента");
-        tg.MainButton.onClick(searchAssistants);
-      }
-      tg.MainButton.show();
-    }
-
-    document.getElementById('subtitle').innerText =
-      role==='assistant' ? 'Заполни анкету один раз — дальше будет кабинет.' : 'Создай профиль один раз — дальше будет кабинет.';
-
-    // Load profile for role
-    if (role === 'assistant') {
+    if (role==='assistant'){
+      document.getElementById('subtitle').innerText = 'Заполни анкету один раз — дальше будет кабинет.';
+      if (tg){ tg.MainButton.setText("Сохранить анкету"); tg.MainButton.onClick(saveAssistant); tg.MainButton.show(); }
       loadAssistant(true);
-    } else {
+      return;
+    }
+
+    if (role==='employer'){
+      document.getElementById('subtitle').innerText = 'Создай профиль один раз — дальше кабинет + поиск по дате.';
+      if (tg){ tg.MainButton.setText("Найти ассистента"); tg.MainButton.onClick(searchAssistants); tg.MainButton.show(); }
       loadEmployer(true);
+      return;
+    }
+
+    if (role==='admin'){
+      document.getElementById('subtitle').innerText = 'Админ-панель.';
+      if (tg){ tg.MainButton.hide(); }
+      document.getElementById('adminPanel').style.display='block';
+      adminLoadSummary();
+      return;
     }
   }
 
-  function hideAssistantAll(){
-    document.getElementById('assistantDash').style.display = 'none';
-    document.getElementById('assistantForm').style.display = 'none';
-  }
-  function hideEmployerAll(){
-    document.getElementById('employerDash').style.display = 'none';
-    document.getElementById('employerForm').style.display = 'none';
-  }
-
+  // -------- Dates UI (assistant) --------
   function renderDates(){
     const el = document.getElementById('a_dates_view');
     if (!selectedDates.length){
@@ -614,10 +742,7 @@ HTML = f"""
       return;
     }
     el.innerHTML = selectedDates.map(d =>
-      `<span class="miniPill">
-         ${escapeHtml(d)}
-         <a class="link" href="#" onclick="removeDate('${d}'); return false;" style="margin-left:8px; text-decoration:none;">✕</a>
-       </span>`
+      `<span class="miniPill">${esc(d)}<a href="#" onclick="removeDate('${d}');return false;">✕</a></span>`
     ).join('');
   }
 
@@ -636,55 +761,45 @@ HTML = f"""
     renderDates();
   }
 
+  // -------- Assistant --------
   function openAssistantForm(){
-    hideAssistantAll();
-    document.getElementById('assistantForm').style.display = 'block';
+    hideAll();
+    document.getElementById('assistantForm').style.display='block';
   }
 
-  function cancelAssistant(){
-    // back to dashboard if exists else stay
-    if (assistantLoaded){
-      showAssistantDashboard(assistantLoaded);
-    } else {
-      // keep form
-      openAssistantForm();
-    }
-  }
-
-  function showAssistantDashboard(a){
+  function showAssistantDash(a){
     assistantLoaded = a;
-    hideAssistantAll();
-    document.getElementById('assistantDash').style.display = 'block';
+    hideAll();
+    document.getElementById('assistantDash').style.display='block';
 
     const summary = [
-      `<b>${escapeHtml(a.name)}</b> • ${escapeHtml(a.city)}`,
-      `Тел: ${escapeHtml(a.phone)}`,
-      `Опыт: ${escapeHtml(a.exp)} • ₽/час: ${escapeHtml(a.rate || '—')} • Рейтинг: ${escapeHtml(String(a.rating || 5))}`
+      `<b>${esc(a.name)}</b> • ${esc(a.city)}`,
+      `Тел: ${esc(a.phone)}`,
+      `Опыт: ${esc(a.exp)} • ₽/час: ${esc(a.rate || '—')} • Рейтинг: ${esc(String(a.rating||5))}`
     ].join('<br/>');
     document.getElementById('assistantSummary').innerHTML = summary;
 
     const pills = document.getElementById('assistantDatesPills');
-    const dates = a.availability_dates || [];
+    const dates = Array.isArray(a.availability_dates) ? a.availability_dates : [];
     if (dates.length){
-      pills.style.display = 'flex';
-      pills.className = 'rowPills';
-      pills.innerHTML = dates.map(d => `<span class="miniPill">${escapeHtml(d)}</span>`).join('');
+      pills.style.display='flex';
+      pills.innerHTML = dates.map(d => `<span class="miniPill">${esc(d)}</span>`).join('');
     } else {
-      pills.style.display = 'none';
-      pills.innerHTML = '';
+      pills.style.display='none';
+      pills.innerHTML='';
     }
   }
 
   async function loadAssistant(showUI){
-    if (!username){
-      // outside Telegram: show form
-      if (showUI){
-        openAssistantForm();
-      }
+    if (!tgUserId && !username){
+      if (showUI) openAssistantForm();
       return;
     }
     try{
-      const r = await fetch('/api/assistant?tg_username=' + encodeURIComponent(username));
+      const qs = new URLSearchParams();
+      if (tgUserId) qs.set('tg_user_id', String(tgUserId));
+      if (username) qs.set('tg_username', username);
+      const r = await fetch('/api/assistant?' + qs.toString());
       const data = await r.json();
       if (!data.assistant){
         assistantLoaded = null;
@@ -692,7 +807,7 @@ HTML = f"""
         return;
       }
       const a = data.assistant;
-      // fill form values
+
       document.getElementById('a_name').value = a.name || '';
       document.getElementById('a_city').value = a.city || '';
       document.getElementById('a_phone').value = a.phone || '';
@@ -704,7 +819,7 @@ HTML = f"""
       selectedDates.sort();
       renderDates();
 
-      if (showUI) showAssistantDashboard(a);
+      if (showUI) showAssistantDash(a);
     }catch(e){
       assistantLoaded = null;
       if (showUI) openAssistantForm();
@@ -713,6 +828,7 @@ HTML = f"""
 
   async function saveAssistant(){
     const payload = {
+      tg_user_id: tgUserId,
       tg_username: username,
       name: document.getElementById('a_name').value.trim(),
       city: document.getElementById('a_city').value,
@@ -720,7 +836,7 @@ HTML = f"""
       exp: document.getElementById('a_exp').value,
       rate: document.getElementById('a_rate').value ? String(document.getElementById('a_rate').value) : null,
       about: document.getElementById('a_about').value.trim(),
-      availability_dates: selectedDates,
+      availability_dates: selectedDates
     };
 
     if (!payload.name || !payload.city || !payload.phone){
@@ -743,49 +859,48 @@ HTML = f"""
       }
       showNote('a_ok', '✅ Сохранено!');
       if (tg) tg.HapticFeedback.notificationOccurred('success');
-      // reload and show dashboard
-      await loadAssistant(true);
+      showAssistantDash(data.assistant);
     }catch(e){
       showNote('a_err', 'Сеть/сервер недоступны.');
-      if (tg) tg.HapticFeedback.notificationOccurred('error');
     }
   }
 
+  function cancelAssistant(){
+    if (assistantLoaded) showAssistantDash(assistantLoaded);
+    else openAssistantForm();
+  }
+
+  // -------- Employer --------
   function openEmployerForm(){
-    hideEmployerAll();
-    document.getElementById('employerForm').style.display = 'block';
+    hideAll();
+    document.getElementById('employerForm').style.display='block';
   }
 
-  function cancelEmployer(){
-    if (employerLoaded){
-      showEmployerDashboard(employerLoaded);
-    } else {
-      openEmployerForm();
-    }
-  }
-
-  function showEmployerDashboard(e){
+  function showEmployerDash(e){
     employerLoaded = e;
-    hideEmployerAll();
-    document.getElementById('employerDash').style.display = 'block';
-    document.getElementById('listWrap').style.display = 'none';
-    document.getElementById('list').innerHTML = '';
+    hideAll();
+    document.getElementById('employerDash').style.display='block';
+    document.getElementById('listWrap').style.display='none';
+    document.getElementById('list').innerHTML='';
 
     const summary = [
-      `<b>${escapeHtml(e.clinic)}</b> • ${escapeHtml(e.city)}`,
-      `Тел: ${escapeHtml(e.phone)}`,
-      `Рейтинг: ${escapeHtml(String(e.rating || 5))} • Комментарий: ${escapeHtml(e.about || '—')}`
+      `<b>${esc(e.clinic)}</b> • ${esc(e.city)}`,
+      `Тел: ${esc(e.phone)}`,
+      `Комментарий: ${esc(e.about || '—')} • Рейтинг: ${esc(String(e.rating||5))}`
     ].join('<br/>');
     document.getElementById('employerSummary').innerHTML = summary;
   }
 
   async function loadEmployer(showUI){
-    if (!username){
+    if (!tgUserId && !username){
       if (showUI) openEmployerForm();
       return;
     }
     try{
-      const r = await fetch('/api/employer?tg_username=' + encodeURIComponent(username));
+      const qs = new URLSearchParams();
+      if (tgUserId) qs.set('tg_user_id', String(tgUserId));
+      if (username) qs.set('tg_username', username);
+      const r = await fetch('/api/employer?' + qs.toString());
       const data = await r.json();
       if (!data.employer){
         employerLoaded = null;
@@ -797,7 +912,7 @@ HTML = f"""
       document.getElementById('e_city').value = e.city || '';
       document.getElementById('e_phone').value = e.phone || '';
       document.getElementById('e_about').value = e.about || '';
-      if (showUI) showEmployerDashboard(e);
+      if (showUI) showEmployerDash(e);
     }catch(e){
       employerLoaded = null;
       if (showUI) openEmployerForm();
@@ -806,15 +921,16 @@ HTML = f"""
 
   async function saveEmployer(){
     const payload = {
+      tg_user_id: tgUserId,
       tg_username: username,
       clinic: document.getElementById('e_clinic').value.trim(),
       city: document.getElementById('e_city').value,
       phone: document.getElementById('e_phone').value.trim(),
-      about: document.getElementById('e_about').value.trim(),
+      about: document.getElementById('e_about').value.trim()
     };
 
     if (!payload.clinic || !payload.city || !payload.phone){
-      showNote('e_err', 'Заполни обязательные поля: клиника/имя, город, телефон.');
+      showNote('e_err2', 'Заполни обязательные поля: клиника/имя, город, телефон.');
       if (tg) tg.HapticFeedback.notificationOccurred('error');
       return;
     }
@@ -827,17 +943,19 @@ HTML = f"""
       });
       const data = await r.json();
       if (!r.ok){
-        showNote('e_err', data.detail || 'Ошибка сохранения.');
-        if (tg) tg.HapticFeedback.notificationOccurred('error');
+        showNote('e_err2', data.detail || 'Ошибка сохранения.');
         return;
       }
       showNote('e_ok', '✅ Сохранено!');
-      if (tg) tg.HapticFeedback.notificationOccurred('success');
-      await loadEmployer(true);
+      showEmployerDash(data.employer);
     }catch(e){
-      showNote('e_err', 'Сеть/сервер недоступны.');
-      if (tg) tg.HapticFeedback.notificationOccurred('error');
+      showNote('e_err2', 'Сеть/сервер недоступны.');
     }
+  }
+
+  function cancelEmployer(){
+    if (employerLoaded) showEmployerDash(employerLoaded);
+    else openEmployerForm();
   }
 
   function tgLink(u){
@@ -848,10 +966,19 @@ HTML = f"""
 
   async function searchAssistants(){
     const city = employerLoaded?.city || document.getElementById('e_city').value;
-    const url = city ? ('/api/assistants?city=' + encodeURIComponent(city)) : '/api/assistants';
+    const date = document.getElementById('e_filter_date').value;
+
+    if (!city){
+      showNote('e_err', 'Сначала выбери город в профиле работодателя.');
+      return;
+    }
+
+    const qs = new URLSearchParams();
+    qs.set('city', city);
+    if (date) qs.set('date', date);
 
     try{
-      const r = await fetch(url);
+      const r = await fetch('/api/assistants?' + qs.toString());
       const list = await r.json();
 
       const wrap = document.getElementById('listWrap');
@@ -860,23 +987,15 @@ HTML = f"""
       wrap.style.display = 'block';
 
       if (!Array.isArray(list) || list.length === 0){
-        box.innerHTML = '<div class="item">Пока нет ассистентов в этом городе.</div>';
+        box.innerHTML = '<div class="item">Никого не найдено по этому фильтру.</div>';
         if (tg) tg.HapticFeedback.notificationOccurred('warning');
         return;
       }
 
       for (const a of list){
         const link = tgLink(a.tg_username);
-        const topRight = link
-          ? `<a class="btn btnPrimary" style="text-decoration:none; display:inline-block; padding:10px 12px; border-radius:12px;" href="${link}" target="_blank">Написать</a>`
-          : `<div class="pill">нет username</div>`;
-
-        const meta = [
-          a.city ? a.city : '',
-          a.exp ? ('опыт: ' + a.exp) : '',
-          a.rate ? ('₽/час: ' + a.rate) : '',
-        ].filter(Boolean).join(' • ');
-
+        const right = link ? `<a class="linkBtn" target="_blank" href="${link}">Написать</a>` : `<span class="pill">нет username</span>`;
+        const meta = [a.city, `опыт: ${a.exp}`, a.rate ? `₽/час: ${a.rate}` : null].filter(Boolean).join(' • ');
         const dates = Array.isArray(a.availability_dates) ? a.availability_dates : [];
         const datesLine = dates.length ? ('Даты: ' + dates.join(', ')) : 'Даты: —';
         const about = (a.about || '').slice(0, 160);
@@ -885,17 +1004,18 @@ HTML = f"""
           <div class="item">
             <div class="itemTop">
               <div>
-                <div class="itemName">${escapeHtml(a.name || 'Ассистент')}</div>
-                <div class="itemMeta">${escapeHtml(meta)}</div>
+                <div class="itemName">${esc(a.name || 'Ассистент')}</div>
+                <div class="itemMeta">${esc(meta)}</div>
               </div>
-              <div>${topRight}</div>
+              <div>${right}</div>
             </div>
-            <div class="small">${escapeHtml(datesLine)}</div>
-            <div class="small">${escapeHtml(about)}</div>
-            <div class="small">Тел: ${escapeHtml(a.phone || '')} • Рейтинг: ${escapeHtml(String(a.rating || 5))}</div>
+            <div class="small">${esc(datesLine)}</div>
+            <div class="small">${esc(about)}</div>
+            <div class="small">Тел: ${esc(a.phone || '')} • Рейтинг: ${esc(String(a.rating||5))}</div>
           </div>
         `;
       }
+
       if (tg) tg.HapticFeedback.notificationOccurred('success');
     }catch(e){
       showNote('e_err', 'Не удалось загрузить список.');
@@ -903,14 +1023,110 @@ HTML = f"""
     }
   }
 
+  // -------- Admin --------
+  async function adminLoadSummary(){
+    try{
+      const r = await fetch('/api/admin/summary?tg_user_id=' + encodeURIComponent(String(tgUserId||0)));
+      const data = await r.json();
+      if (!r.ok){
+        document.getElementById('adminSummary').innerText = 'Нет доступа.';
+        return;
+      }
+      document.getElementById('adminSummary').innerHTML =
+        `Ассистенты: <b>${esc(String(data.assistants))}</b><br/>Работодатели: <b>${esc(String(data.employers))}</b>`;
+    }catch(e){
+      showNote('adminErr', 'Ошибка админки.');
+    }
+  }
+
+  async function adminLoadAssistants(){
+    try{
+      const r = await fetch('/api/admin/assistants?tg_user_id=' + encodeURIComponent(String(tgUserId||0)));
+      const data = await r.json();
+      if (!r.ok){ showNote('adminErr', data.detail || 'Нет доступа'); return; }
+      renderAdminList('assistant', data.items || []);
+    }catch(e){ showNote('adminErr', 'Ошибка загрузки'); }
+  }
+
+  async function adminLoadEmployers(){
+    try{
+      const r = await fetch('/api/admin/employers?tg_user_id=' + encodeURIComponent(String(tgUserId||0)));
+      const data = await r.json();
+      if (!r.ok){ showNote('adminErr', data.detail || 'Нет доступа'); return; }
+      renderAdminList('employer', data.items || []);
+    }catch(e){ showNote('adminErr', 'Ошибка загрузки'); }
+  }
+
+  function renderAdminList(kind, items){
+    const box = document.getElementById('adminList');
+    box.innerHTML = '';
+    if (!items.length){
+      box.innerHTML = '<div class="item">Пусто</div>';
+      return;
+    }
+    for (const x of items){
+      const title = kind === 'assistant'
+        ? `${esc(x.name)} • ${esc(x.city)}`
+        : `${esc(x.clinic)} • ${esc(x.city)}`;
+      const sub = kind === 'assistant'
+        ? `Тел: ${esc(x.phone)} • tg: ${esc(x.tg_username||'—')} • id: ${esc(String(x.id))}`
+        : `Тел: ${esc(x.phone)} • tg: ${esc(x.tg_username||'—')} • id: ${esc(String(x.id))}`;
+
+      box.innerHTML += `
+        <div class="item">
+          <div class="itemTop">
+            <div>
+              <div class="itemName">${title}</div>
+              <div class="itemMeta">${sub}</div>
+              <div class="small">Создано: ${esc(String(x.created_at||''))}</div>
+            </div>
+            <div>
+              <a class="linkBtn" href="#" onclick="adminDelete('${kind}', ${x.id}); return false;">Удалить</a>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+  }
+
+  async function adminDelete(kind, id){
+    if (!confirm('Точно удалить?')) return;
+    try{
+      const qs = new URLSearchParams();
+      qs.set('kind', kind);
+      qs.set('item_id', String(id));
+      qs.set('tg_user_id', String(tgUserId||0));
+      const r = await fetch('/api/admin/delete?' + qs.toString(), {method:'POST'});
+      const data = await r.json();
+      if (!r.ok){ showNote('adminErr', data.detail || 'Ошибка'); return; }
+      // refresh
+      if (kind==='assistant') adminLoadAssistants(); else adminLoadEmployers();
+    }catch(e){ showNote('adminErr', 'Ошибка'); }
+  }
+
+  // -------- Init --------
   (function init(){
     if (tg){
       tg.ready();
       const u = tg.initDataUnsafe?.user;
+      tgUserId = u?.id || null;
       username = u?.username ? ('@' + u.username) : null;
-      document.getElementById('tgBadge').innerText = username ? ('Telegram: ' + username) : 'Telegram: без username';
+
+      document.getElementById('tgBadge').innerText = tgUserId
+        ? ('Telegram: ' + (username || 'без username'))
+        : 'Telegram: без данных';
+
+      // show admin tab only for your ID
+      if (tgUserId === 810418985){
+        document.getElementById('tabAdmin').style.display = 'inline-block';
+      }
+
+      // Nice: show main button always
+      tg.MainButton.show();
     } else {
       document.getElementById('tgBadge').innerText = 'Открыто не из Telegram';
+      // Hide admin tab if outside tg
+      document.getElementById('tabAdmin').style.display = 'none';
     }
 
     const role = localStorage.getItem('role') || 'assistant';
@@ -919,7 +1135,7 @@ HTML = f"""
 </script>
 </body>
 </html>
-"""
+'''
 
 
 @app.get("/", response_class=HTMLResponse)
